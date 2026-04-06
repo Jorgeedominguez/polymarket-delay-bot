@@ -19,6 +19,22 @@ export interface GammaMarket {
   closed?: boolean;
   acceptingOrders?: boolean;
   events?: GammaEventReference[];
+  orderPriceMinTickSize?: number | string;
+  order_price_min_tick_size?: number | string;
+  minimumTickSize?: number | string;
+  minimum_tick_size?: number | string;
+  orderMinSize?: number | string;
+  order_min_size?: number | string;
+  minimumOrderSize?: number | string;
+  minimum_order_size?: number | string;
+  makerBaseFee?: number | string;
+  maker_base_fee?: number | string;
+  takerBaseFee?: number | string;
+  taker_base_fee?: number | string;
+  enableOrderBook?: boolean;
+  enable_order_book?: boolean;
+  negRisk?: boolean;
+  neg_risk?: boolean;
 }
 
 export interface GammaEvent {
@@ -268,6 +284,22 @@ export class PolymarketDiscoveryClient {
       closed: market.closed,
       acceptingOrders: market.acceptingOrders,
       events: this.mergeEventReferences(market.events, eventRef ? [eventRef] : []),
+      orderPriceMinTickSize: market.orderPriceMinTickSize,
+      order_price_min_tick_size: market.order_price_min_tick_size,
+      minimumTickSize: market.minimumTickSize,
+      minimum_tick_size: market.minimum_tick_size,
+      orderMinSize: market.orderMinSize,
+      order_min_size: market.order_min_size,
+      minimumOrderSize: market.minimumOrderSize,
+      minimum_order_size: market.minimum_order_size,
+      makerBaseFee: market.makerBaseFee,
+      maker_base_fee: market.maker_base_fee,
+      takerBaseFee: market.takerBaseFee,
+      taker_base_fee: market.taker_base_fee,
+      enableOrderBook: market.enableOrderBook,
+      enable_order_book: market.enable_order_book,
+      negRisk: market.negRisk,
+      neg_risk: market.neg_risk,
     };
   }
 

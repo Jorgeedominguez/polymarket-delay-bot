@@ -35,6 +35,15 @@ function parseJsonArray(value: string[] | string | undefined): string[] {
   }
 }
 
+function parseNumber(value: number | string | undefined, fallback: number): number {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function normalize(value: string): string {
   return value.trim().toLowerCase();
 }
@@ -334,7 +343,7 @@ export function toDiscoveredMarket(
 
 export function toMarketMetadata(
   market: GammaMarket,
-  clobMarket: any,
+  clobMarket?: any,
   evaluation = evaluateBtcTargetMarket(market),
 ): MarketMetadata | null {
   const discovered = toDiscoveredMarket(market, evaluation);
@@ -351,14 +360,28 @@ export function toMarketMetadata(
     intervalMinutes: discovered.intervalMinutes,
     yesTokenId: outcomeTokenIds.YES,
     noTokenId: outcomeTokenIds.NO,
-    minimumTickSize: Number(clobMarket.minimum_tick_size ?? 0.01),
-    minimumOrderSize: Number(clobMarket.minimum_order_size ?? 1),
-    takerFeeBps: Number(clobMarket.taker_base_fee ?? 0),
-    makerFeeBps: Number(clobMarket.maker_base_fee ?? 0),
-    active: Boolean(clobMarket.active ?? discovered.active),
-    closed: Boolean(clobMarket.closed ?? discovered.closed),
-    enableOrderBook: Boolean(clobMarket.enable_order_book ?? true),
-    negRisk: Boolean(clobMarket.neg_risk ?? false),
+    minimumTickSize: parseNumber(
+      clobMarket?.minimum_tick_size ??
+        market.orderPriceMinTickSize ??
+        market.order_price_min_tick_size ??
+        market.minimumTickSize ??
+        market.minimum_tick_size,
+      0.01,
+    ),
+    minimumOrderSize: parseNumber(
+      clobMarket?.minimum_order_size ??
+        market.orderMinSize ??
+        market.order_min_size ??
+        market.minimumOrderSize ??
+        market.minimum_order_size,
+      1,
+    ),
+    takerFeeBps: parseNumber(clobMarket?.taker_base_fee ?? market.takerBaseFee ?? market.taker_base_fee, 0),
+    makerFeeBps: parseNumber(clobMarket?.maker_base_fee ?? market.makerBaseFee ?? market.maker_base_fee, 0),
+    active: Boolean(clobMarket?.active ?? market.active ?? market.acceptingOrders ?? discovered.active),
+    closed: Boolean(clobMarket?.closed ?? market.closed ?? discovered.closed),
+    enableOrderBook: Boolean(clobMarket?.enable_order_book ?? market.enableOrderBook ?? market.enable_order_book ?? true),
+    negRisk: Boolean(clobMarket?.neg_risk ?? market.negRisk ?? market.neg_risk ?? false),
     lastDiscoveredAt: Date.now(),
   };
 }

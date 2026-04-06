@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { GammaMarket } from "../src/clients/polymarketDiscoveryClient";
-import { evaluateBtcTargetMarket, toDiscoveredMarket } from "../src/discovery/marketMapper";
+import { evaluateBtcTargetMarket, toDiscoveredMarket, toMarketMetadata } from "../src/discovery/marketMapper";
 
 function buildMarket(overrides: Partial<GammaMarket> = {}): GammaMarket {
   return {
@@ -82,5 +82,31 @@ describe("marketMapper BTC discovery", () => {
     expect(discovered).not.toBeNull();
     expect(discovered?.intervalMinutes).toBe(15);
     expect(discovered?.slug).toBe("btc-updown-15m-1775505900");
+  });
+
+  it("builds metadata from Gamma fields when CLOB enrichment is unavailable", () => {
+    const market = buildMarket({
+      slug: "btc-updown-5m-1775505000",
+      question: "Bitcoin Up or Down - Apr 6, 10:15 AM to 10:20 AM ET",
+      outcomes: ["Yes", "No"],
+      clobTokenIds: ["token-yes", "token-no"],
+      orderPriceMinTickSize: "0.01",
+      orderMinSize: "5",
+      takerBaseFee: "12",
+      makerBaseFee: "3",
+      enableOrderBook: true,
+      negRisk: false,
+    });
+
+    const metadata = toMarketMetadata(market, undefined, evaluateBtcTargetMarket(market));
+
+    expect(metadata).not.toBeNull();
+    expect(metadata?.yesTokenId).toBe("token-yes");
+    expect(metadata?.noTokenId).toBe("token-no");
+    expect(metadata?.minimumTickSize).toBe(0.01);
+    expect(metadata?.minimumOrderSize).toBe(5);
+    expect(metadata?.takerFeeBps).toBe(12);
+    expect(metadata?.makerFeeBps).toBe(3);
+    expect(metadata?.enableOrderBook).toBe(true);
   });
 });

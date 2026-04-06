@@ -92,11 +92,39 @@ export class BtcPolymarketDiscovery {
 
       discovered.push(discoveredMarket);
 
+      const enrichmentId = discoveredMarket.conditionId;
+      const enrichmentEndpoint = `/markets/${enrichmentId}`;
+
       try {
-        const clobMarket = await this.clobGateway.getMarket(discoveredMarket.conditionId);
+        this.logger.info(
+          {
+            component: "btcDiscovery",
+            marketId: market.id,
+            slug: market.slug,
+            conditionId: discoveredMarket.conditionId,
+            enrichmentId,
+            enrichmentEndpoint,
+            enrichmentSource: "clob",
+          },
+          "Attempting optional CLOB metadata enrichment",
+        );
+
+        const clobMarket = await this.clobGateway.getMarket(enrichmentId);
         const mappedMetadata = toMarketMetadata(market, clobMarket, evaluation);
         if (mappedMetadata) {
           metadata.push(mappedMetadata);
+          this.logger.info(
+            {
+              component: "btcDiscovery",
+              marketId: market.id,
+              slug: market.slug,
+              conditionId: discoveredMarket.conditionId,
+              enrichmentId,
+              enrichmentEndpoint,
+              metadataSource: "gamma+clob",
+            },
+            "Built BTC market metadata",
+          );
         } else {
           this.logger.info(
             {
@@ -112,13 +140,36 @@ export class BtcPolymarketDiscovery {
           );
         }
       } catch (error) {
+        const fallbackMetadata = toMarketMetadata(market, undefined, evaluation);
+        if (fallbackMetadata) {
+          metadata.push(fallbackMetadata);
+          this.logger.warn(
+            {
+              component: "btcDiscovery",
+              marketId: market.id,
+              slug: market.slug,
+              conditionId: discoveredMarket.conditionId,
+              enrichmentId,
+              enrichmentEndpoint,
+              metadataSource: "gamma",
+              err: error,
+            },
+            "CLOB metadata enrichment failed; using Gamma metadata for shadow mode",
+          );
+          continue;
+        }
+
         this.logger.error(
           {
             component: "btcDiscovery",
             conditionId: discoveredMarket.conditionId,
+            slug: market.slug,
+            enrichmentId,
+            enrichmentEndpoint,
+            metadataSource: "none",
             err: error,
           },
-          "Failed to enrich Polymarket metadata from CLOB",
+          "Failed to build BTC market metadata from both CLOB and Gamma",
         );
       }
     }
