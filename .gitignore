@@ -1,0 +1,11 @@
+.env
+node_modules/
+dist/
+data/
+logs/
+*.db
+*.sqlite
+.npm-cache/
+.tools/
+.DS_Store
+Thumbs.db
