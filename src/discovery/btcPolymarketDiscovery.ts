@@ -17,12 +17,11 @@ export class BtcPolymarketDiscovery {
   ) {}
 
   async discover(): Promise<DiscoveryResult> {
-    const gammaMarkets = await this.discoveryClient.listActiveMarkets();
-    const evaluations = gammaMarkets.map((market) => ({
+    const scanResult = await this.discoveryClient.collectBtcMarkets((market) => evaluateBtcTargetMarket(market));
+    const evaluations = scanResult.markets.map((market) => ({
       market,
       evaluation: evaluateBtcTargetMarket(market),
     }));
-    const candidateGammaMarkets = evaluations.filter((item) => item.evaluation.isCandidate);
 
     const discovered: DiscoveredMarket[] = [];
     const metadata: MarketMetadata[] = [];
@@ -30,13 +29,20 @@ export class BtcPolymarketDiscovery {
     this.logger.info(
       {
         component: "btcDiscovery",
-        totalGammaMarkets: gammaMarkets.length,
-        candidates: candidateGammaMarkets.length,
+        source: scanResult.stats.source,
+        pageSize: scanResult.stats.pageSize,
+        pagesConsulted: scanResult.stats.pagesConsulted,
+        marketsScanned: scanResult.stats.marketsScanned,
+        candidatesSeen: scanResult.stats.candidatesSeen,
+        candidatesRetained: scanResult.stats.candidatesRetained,
+        retainedByInterval: scanResult.stats.retainedByInterval,
+        earlyStop: scanResult.stats.earlyStop,
+        fallbackUsed: scanResult.stats.fallbackUsed,
       },
-      "Evaluated Gamma markets for BTC discovery",
+      "Completed Gamma BTC discovery scan",
     );
 
-    for (const { market, evaluation } of candidateGammaMarkets) {
+    for (const { market, evaluation } of evaluations) {
       if (!evaluation.isTarget) {
         this.logger.info(
           {
@@ -122,7 +128,9 @@ export class BtcPolymarketDiscovery {
         component: "btcDiscovery",
         discovered: discovered.length,
         metadata: metadata.length,
-        candidates: candidateGammaMarkets.length,
+        candidatesRetained: scanResult.stats.candidatesRetained,
+        pagesConsulted: scanResult.stats.pagesConsulted,
+        earlyStop: scanResult.stats.earlyStop,
       },
       "BTC Polymarket discovery completed",
     );

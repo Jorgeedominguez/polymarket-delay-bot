@@ -28,30 +28,89 @@ export interface GammaEvent {
   markets?: GammaMarket[];
 }
 
+export interface GammaMarketAssessment {
+  isCandidate: boolean;
+  isTarget: boolean;
+  intervalMinutes: 5 | 15 | null;
+}
+
+export interface BtcMarketScanOptions {
+  pageSize?: number;
+  maxRetainedMarkets?: number;
+  maxRetainedPerInterval?: number;
+  fallbackToMarkets?: boolean;
+}
+
+export interface BtcMarketScanStats {
+  source: "events" | "markets" | "events+markets";
+  pageSize: number;
+  pagesConsulted: number;
+  marketsScanned: number;
+  candidatesSeen: number;
+  candidatesRetained: number;
+  retainedByInterval: Record<5 | 15, number>;
+  earlyStop: boolean;
+  fallbackUsed: boolean;
+}
+
+export interface BtcMarketScanResult {
+  markets: GammaMarket[];
+  stats: BtcMarketScanStats;
+}
+
+const DEFAULT_PAGE_SIZE = 100;
+const DEFAULT_MAX_RETAINED_MARKETS = 8;
+const DEFAULT_MAX_RETAINED_PER_INTERVAL = 4;
+const MB = 1024 * 1024;
+
 export class PolymarketDiscoveryClient {
   constructor(
     private readonly gammaUrl: string,
     private readonly logger: Logger,
   ) {}
 
-  async listActiveMarkets(limit = 500): Promise<GammaMarket[]> {
-    const directMarkets = await this.fetchAllMarketPages(limit);
-    const eventMarkets = await this.fetchAllEventMarketPages(limit);
-    const markets = this.deduplicateMarkets([...directMarkets, ...eventMarkets]);
+  async collectBtcMarkets(
+    assessMarket: (market: GammaMarket) => GammaMarketAssessment,
+    options: BtcMarketScanOptions = {},
+  ): Promise<BtcMarketScanResult> {
+    const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
+    const maxRetainedMarkets = options.maxRetainedMarkets ?? DEFAULT_MAX_RETAINED_MARKETS;
+    const maxRetainedPerInterval = options.maxRetainedPerInterval ?? DEFAULT_MAX_RETAINED_PER_INTERVAL;
+    const fallbackToMarkets = options.fallbackToMarkets ?? true;
 
-    this.logger.info(
-      {
-        component: "polymarketDiscovery",
-        directMarkets: directMarkets.length,
-        eventMarkets: eventMarkets.length,
-        deduplicatedMarkets: markets.length,
+    const fromEvents = await this.scanSource("events", assessMarket, {
+      pageSize,
+      maxRetainedMarkets,
+      maxRetainedPerInterval,
+    });
+
+    if (fromEvents.stats.earlyStop || fromEvents.markets.length > 0 || !fallbackToMarkets) {
+      return fromEvents;
+    }
+
+    const fromMarkets = await this.scanSource("markets", assessMarket, {
+      pageSize,
+      maxRetainedMarkets,
+      maxRetainedPerInterval,
+    });
+
+    return {
+      markets: fromMarkets.markets,
+      stats: {
+        source: "events+markets",
+        pageSize,
+        pagesConsulted: fromEvents.stats.pagesConsulted + fromMarkets.stats.pagesConsulted,
+        marketsScanned: fromEvents.stats.marketsScanned + fromMarkets.stats.marketsScanned,
+        candidatesSeen: fromEvents.stats.candidatesSeen + fromMarkets.stats.candidatesSeen,
+        candidatesRetained: fromMarkets.stats.candidatesRetained,
+        retainedByInterval: fromMarkets.stats.retainedByInterval,
+        earlyStop: fromMarkets.stats.earlyStop,
+        fallbackUsed: true,
       },
-      "Fetched active Gamma markets",
-    );
-    return markets;
+    };
   }
 
-  async fetchMarketsPage(offset = 0, limit = 500): Promise<GammaMarket[]> {
+  async fetchMarketsPage(offset = 0, limit = DEFAULT_PAGE_SIZE): Promise<GammaMarket[]> {
     const url = new URL("/markets", this.gammaUrl);
     url.searchParams.set("active", "true");
     url.searchParams.set("closed", "false");
@@ -66,7 +125,7 @@ export class PolymarketDiscoveryClient {
     return (await response.json()) as GammaMarket[];
   }
 
-  async fetchEventsPage(offset = 0, limit = 500): Promise<GammaEvent[]> {
+  async fetchEventsPage(offset = 0, limit = DEFAULT_PAGE_SIZE): Promise<GammaEvent[]> {
     const url = new URL("/events", this.gammaUrl);
     url.searchParams.set("active", "true");
     url.searchParams.set("closed", "false");
@@ -81,46 +140,135 @@ export class PolymarketDiscoveryClient {
     return (await response.json()) as GammaEvent[];
   }
 
-  private async fetchAllMarketPages(limit: number): Promise<GammaMarket[]> {
-    const markets: GammaMarket[] = [];
+  private async scanSource(
+    source: "events" | "markets",
+    assessMarket: (market: GammaMarket) => GammaMarketAssessment,
+    options: Required<Pick<BtcMarketScanOptions, "pageSize" | "maxRetainedMarkets" | "maxRetainedPerInterval">>,
+  ): Promise<BtcMarketScanResult> {
+    const retained = new Map<string, GammaMarket>();
+    const retainedByInterval: Record<5 | 15, number> = { 5: 0, 15: 0 };
     let offset = 0;
+    let pagesConsulted = 0;
+    let marketsScanned = 0;
+    let candidatesSeen = 0;
+    let earlyStop = false;
 
     while (true) {
-      const page = await this.fetchMarketsPage(offset, limit);
-      markets.push(...page);
+      const pageMarkets =
+        source === "events"
+          ? this.flattenEventMarkets(await this.fetchEventsPage(offset, options.pageSize))
+          : (await this.fetchMarketsPage(offset, options.pageSize)).map((market) => this.projectMarket(market));
 
-      if (page.length < limit) {
+      pagesConsulted += 1;
+      marketsScanned += pageMarkets.length;
+
+      for (const market of pageMarkets) {
+        const assessment = assessMarket(market);
+        if (!assessment.isCandidate) {
+          continue;
+        }
+
+        candidatesSeen += 1;
+
+        if (!assessment.isTarget || !assessment.intervalMinutes) {
+          continue;
+        }
+
+        const key = this.toMarketKey(market);
+        if (retained.has(key)) {
+          continue;
+        }
+
+        if (retained.size >= options.maxRetainedMarkets) {
+          earlyStop = true;
+          break;
+        }
+
+        if (retainedByInterval[assessment.intervalMinutes] >= options.maxRetainedPerInterval) {
+          continue;
+        }
+
+        retained.set(key, market);
+        retainedByInterval[assessment.intervalMinutes] += 1;
+
+        if (
+          retainedByInterval[5] >= options.maxRetainedPerInterval &&
+          retainedByInterval[15] >= options.maxRetainedPerInterval
+        ) {
+          earlyStop = true;
+          break;
+        }
+      }
+
+      this.logger.info(
+        {
+          component: "polymarketDiscovery",
+          source,
+          page: pagesConsulted,
+          offset,
+          pageSize: options.pageSize,
+          pageMarkets: pageMarkets.length,
+          marketsScanned,
+          candidatesSeen,
+          candidatesRetained: retained.size,
+          retainedByInterval,
+          earlyStop,
+          ...this.getMemorySnapshot(),
+        },
+        "Scanned Gamma discovery page",
+      );
+
+      if (earlyStop || pageMarkets.length < options.pageSize) {
         break;
       }
 
-      offset += limit;
+      offset += options.pageSize;
+    }
+
+    return {
+      markets: [...retained.values()],
+      stats: {
+        source,
+        pageSize: options.pageSize,
+        pagesConsulted,
+        marketsScanned,
+        candidatesSeen,
+        candidatesRetained: retained.size,
+        retainedByInterval,
+        earlyStop,
+        fallbackUsed: false,
+      },
+    };
+  }
+
+  private flattenEventMarkets(events: GammaEvent[]): GammaMarket[] {
+    const markets: GammaMarket[] = [];
+
+    for (const event of events) {
+      for (const market of event.markets ?? []) {
+        markets.push(this.projectMarket(market, { id: event.id, slug: event.slug }));
+      }
     }
 
     return markets;
   }
 
-  private async fetchAllEventMarketPages(limit: number): Promise<GammaMarket[]> {
-    const markets: GammaMarket[] = [];
-    let offset = 0;
-
-    while (true) {
-      const page = await this.fetchEventsPage(offset, limit);
-      const flattened = page.flatMap((event) =>
-        (event.markets ?? []).map((market) => ({
-          ...market,
-          events: this.mergeEventReferences(market.events, [{ id: event.id, slug: event.slug }]),
-        })),
-      );
-      markets.push(...flattened);
-
-      if (page.length < limit) {
-        break;
-      }
-
-      offset += limit;
-    }
-
-    return markets;
+  private projectMarket(market: GammaMarket, eventRef?: GammaEventReference): GammaMarket {
+    return {
+      id: String(market.id),
+      question: market.question,
+      slug: market.slug,
+      ticker: market.ticker,
+      conditionId: market.conditionId,
+      condition_id: market.condition_id,
+      clobTokenIds: market.clobTokenIds,
+      clob_token_ids: market.clob_token_ids,
+      outcomes: market.outcomes,
+      active: market.active,
+      closed: market.closed,
+      acceptingOrders: market.acceptingOrders,
+      events: this.mergeEventReferences(market.events, eventRef ? [eventRef] : []),
+    };
   }
 
   private mergeEventReferences(
@@ -132,35 +280,29 @@ export class PolymarketDiscoveryClient {
 
     return merged.filter((eventRef) => {
       const key = `${eventRef.id ?? ""}:${eventRef.slug ?? ""}`;
+      if (!eventRef.id && !eventRef.slug) {
+        return false;
+      }
+
       if (seen.has(key)) {
         return false;
       }
 
       seen.add(key);
-      return Boolean(eventRef.id ?? eventRef.slug);
+      return true;
     });
   }
 
-  private deduplicateMarkets(markets: GammaMarket[]): GammaMarket[] {
-    const deduplicated = new Map<string, GammaMarket>();
+  private toMarketKey(market: GammaMarket): string {
+    return market.conditionId ?? market.condition_id ?? market.slug ?? market.id;
+  }
 
-    for (const market of markets) {
-      const conditionId = market.conditionId ?? market.condition_id;
-      const key = conditionId || market.slug || market.id;
-      const existing = deduplicated.get(key);
-
-      if (!existing) {
-        deduplicated.set(key, market);
-        continue;
-      }
-
-      deduplicated.set(key, {
-        ...existing,
-        ...market,
-        events: this.mergeEventReferences(existing.events, market.events ?? []),
-      });
-    }
-
-    return [...deduplicated.values()];
+  private getMemorySnapshot(): Record<string, number> {
+    const usage = process.memoryUsage();
+    return {
+      rssMb: Number((usage.rss / MB).toFixed(1)),
+      heapUsedMb: Number((usage.heapUsed / MB).toFixed(1)),
+      heapTotalMb: Number((usage.heapTotal / MB).toFixed(1)),
+    };
   }
 }
