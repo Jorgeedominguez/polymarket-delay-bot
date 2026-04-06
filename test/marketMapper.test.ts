@@ -84,7 +84,7 @@ describe("marketMapper BTC discovery", () => {
     expect(discovered?.slug).toBe("btc-updown-15m-1775505900");
   });
 
-  it("builds metadata from Gamma fields when CLOB enrichment is unavailable", () => {
+  it("builds metadata for YES/NO markets when CLOB enrichment is unavailable", () => {
     const market = buildMarket({
       slug: "btc-updown-5m-1775505000",
       question: "Bitcoin Up or Down - Apr 6, 10:15 AM to 10:20 AM ET",
@@ -108,5 +108,37 @@ describe("marketMapper BTC discovery", () => {
     expect(metadata?.takerFeeBps).toBe(12);
     expect(metadata?.makerFeeBps).toBe(3);
     expect(metadata?.enableOrderBook).toBe(true);
+  });
+
+  it("maps UP/DOWN outcomes into internal YES/NO token slots", () => {
+    const market = buildMarket({
+      slug: "btc-updown-15m-1775505900",
+      question: "Bitcoin Up or Down - Apr 6, 10:15 AM to 10:30 AM ET",
+      outcomes: ["UP", "DOWN"],
+      clobTokenIds: ["token-up", "token-down"],
+      orderPriceMinTickSize: "0.01",
+      orderMinSize: "5",
+    });
+
+    const metadata = toMarketMetadata(market, undefined, evaluateBtcTargetMarket(market));
+
+    expect(metadata).not.toBeNull();
+    expect(metadata?.yesTokenId).toBe("token-up");
+    expect(metadata?.noTokenId).toBe("token-down");
+  });
+
+  it("returns null for invalid outcomes that are neither YES/NO nor UP/DOWN", () => {
+    const market = buildMarket({
+      slug: "btc-updown-15m-1775505900",
+      question: "Bitcoin Up or Down - Apr 6, 10:15 AM to 10:30 AM ET",
+      outcomes: ["BULL", "BEAR"],
+      clobTokenIds: ["token-bull", "token-bear"],
+      orderPriceMinTickSize: "0.01",
+      orderMinSize: "5",
+    });
+
+    const metadata = toMarketMetadata(market, undefined, evaluateBtcTargetMarket(market));
+
+    expect(metadata).toBeNull();
   });
 });

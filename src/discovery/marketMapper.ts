@@ -307,8 +307,8 @@ function mapOutcomeTokenIds(market: GammaMarket): Record<Outcome, string> | null
     outcomeMap.set(outcome.trim().toUpperCase(), tokenIds[index]);
   });
 
-  const yes = outcomeMap.get("YES");
-  const no = outcomeMap.get("NO");
+  const yes = outcomeMap.get("YES") ?? outcomeMap.get("UP");
+  const no = outcomeMap.get("NO") ?? outcomeMap.get("DOWN");
   if (!yes || !no) {
     return null;
   }
