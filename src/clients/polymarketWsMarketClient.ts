@@ -32,6 +32,13 @@ interface BookState {
   snapshot: PolymarketBookSnapshot;
 }
 
+interface MarketSubscriptionPayload {
+  assets_ids: string[];
+  custom_feature_enabled: true;
+  type?: "market";
+  operation?: "subscribe";
+}
+
 export class PolymarketWsMarketClient extends EventEmitter {
   private socket?: WebSocket;
   private stopped = false;
@@ -39,8 +46,11 @@ export class PolymarketWsMarketClient extends EventEmitter {
   private lastMessageAt: number | null = null;
   private connected = false;
   private readonly assetIds = new Set<string>();
+  private readonly subscribedAssetIds = new Set<string>();
   private readonly metadataByAsset = new Map<string, { conditionId: string; outcome: Outcome; minOrderSize: number; tickSize: number }>();
   private readonly books = new Map<string, BookState>();
+  private initialSubscriptionSent = false;
+  private lastSubscriptionPayload: MarketSubscriptionPayload | null = null;
 
   constructor(private readonly logger: Logger) {
     super();
@@ -75,11 +85,32 @@ export class PolymarketWsMarketClient extends EventEmitter {
   }
 
   subscribeAssets(assetIds: string[]): void {
-    for (const assetId of assetIds) {
+    const beforeSize = this.assetIds.size;
+    const sanitized = this.sanitizeAssetIds(assetIds);
+    for (const assetId of sanitized.validAssetIds) {
       this.assetIds.add(assetId);
     }
 
-    this.sendSubscription();
+    const newAssetIds = sanitized.validAssetIds.filter((assetId) => !this.subscribedAssetIds.has(assetId));
+
+    this.logger.info(
+      {
+        component: "polyMarketWs",
+        requestedAssetCount: assetIds.length,
+        validAssetCount: sanitized.validAssetIds.length,
+        invalidAssetCount: sanitized.invalidAssetCount,
+        duplicateAssetCount: sanitized.duplicateAssetCount,
+        totalTrackedAssets: this.assetIds.size,
+        newAssetCount: newAssetIds.length,
+      },
+      "Validated market websocket asset IDs",
+    );
+
+    if (this.assetIds.size === beforeSize && newAssetIds.length === 0) {
+      return;
+    }
+
+    this.sendSubscription(newAssetIds);
   }
 
   getBook(assetId: string): PolymarketBookSnapshot | undefined {
@@ -100,6 +131,8 @@ export class PolymarketWsMarketClient extends EventEmitter {
     this.socket.on("open", () => {
       this.connected = true;
       this.reconnectAttempts = 0;
+      this.initialSubscriptionSent = false;
+      this.subscribedAssetIds.clear();
       this.logger.info({ component: "polyMarketWs" }, "Connected to Polymarket market websocket");
       this.sendSubscription();
       this.emit("connected");
@@ -107,11 +140,7 @@ export class PolymarketWsMarketClient extends EventEmitter {
 
     this.socket.on("message", (raw) => {
       this.lastMessageAt = Date.now();
-      const payload = JSON.parse(raw.toString()) as MarketSocketMessage | MarketSocketMessage[];
-      const messages = Array.isArray(payload) ? payload : [payload];
-      for (const message of messages) {
-        this.handleMessage(message);
-      }
+      this.handleRawMessage(raw);
     });
 
     this.socket.on("error", (error) => {
@@ -121,6 +150,8 @@ export class PolymarketWsMarketClient extends EventEmitter {
 
     this.socket.on("close", () => {
       this.connected = false;
+      this.initialSubscriptionSent = false;
+      this.subscribedAssetIds.clear();
       this.emit("disconnected");
 
       if (!this.stopped) {
@@ -148,6 +179,65 @@ export class PolymarketWsMarketClient extends EventEmitter {
         tickSize: message.tick_size ? safeNumber(message.tick_size, 0) : undefined,
         minOrderSize: message.min_order_size ? safeNumber(message.min_order_size, 0) : undefined,
       });
+    }
+  }
+
+  private handleRawMessage(raw: unknown): void {
+    const rawPayload = this.toRawText(raw).trim();
+    if (!rawPayload) {
+      this.logger.warn({ component: "polyMarketWs", rawPayload }, "Received empty payload from Polymarket market websocket");
+      return;
+    }
+
+    if (rawPayload === "PONG") {
+      this.logger.info({ component: "polyMarketWs" }, "Received PONG from Polymarket market websocket");
+      return;
+    }
+
+    let payload: MarketSocketMessage | MarketSocketMessage[];
+    try {
+      payload = JSON.parse(rawPayload) as MarketSocketMessage | MarketSocketMessage[];
+    } catch {
+      this.logger.warn(
+        {
+          component: "polyMarketWs",
+          rawPayload,
+          lastSubscriptionPayload: this.lastSubscriptionPayload,
+        },
+        "Received non-JSON payload from Polymarket market websocket",
+      );
+
+      if (rawPayload.toUpperCase() === "INVALID OPERATION") {
+        this.handleInvalidOperation(rawPayload);
+      }
+
+      return;
+    }
+
+    const messages = Array.isArray(payload) ? payload : [payload];
+    for (const message of messages) {
+      this.handleMessage(message);
+    }
+  }
+
+  private handleInvalidOperation(rawPayload: string): void {
+    this.logger.error(
+      {
+        component: "polyMarketWs",
+        rawPayload,
+        trackedAssetCount: this.assetIds.size,
+        subscribedAssetCount: this.subscribedAssetIds.size,
+        lastSubscriptionPayload: this.lastSubscriptionPayload,
+      },
+      "Polymarket market websocket rejected the subscription with INVALID OPERATION",
+    );
+
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.logger.warn(
+        { component: "polyMarketWs" },
+        "Closing market websocket after INVALID OPERATION so the normal reconnect flow can retry safely",
+      );
+      this.socket.close();
     }
   }
 
@@ -238,18 +328,49 @@ export class PolymarketWsMarketClient extends EventEmitter {
     }));
   }
 
-  private sendSubscription(): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN || this.assetIds.size === 0) {
+  private sendSubscription(requestedAssetIds?: string[]): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       return;
     }
 
-    this.socket.send(
-      JSON.stringify({
-        type: "market",
-        assets_ids: [...this.assetIds],
-        custom_feature_enabled: true,
-      }),
+    const assetIds = requestedAssetIds && requestedAssetIds.length > 0 ? requestedAssetIds : [...this.assetIds];
+    const sanitized = this.sanitizeAssetIds(assetIds);
+    if (sanitized.validAssetIds.length === 0) {
+      this.logger.warn(
+        {
+          component: "polyMarketWs",
+          requestedAssetCount: assetIds.length,
+          invalidAssetCount: sanitized.invalidAssetCount,
+        },
+        "Skipped market websocket subscription because there were no valid asset IDs",
+      );
+      return;
+    }
+
+    const payload = this.initialSubscriptionSent
+      ? this.buildIncrementalSubscriptionPayload(
+          sanitized.validAssetIds.filter((assetId) => !this.subscribedAssetIds.has(assetId)),
+        )
+      : this.buildInitialSubscriptionPayload(sanitized.validAssetIds);
+
+    if (!payload || payload.assets_ids.length === 0) {
+      return;
+    }
+
+    this.lastSubscriptionPayload = payload;
+    this.logger.info(
+      {
+        component: "polyMarketWs",
+        subscriptionPayload: payload,
+        trackedAssetCount: this.assetIds.size,
+        subscribedAssetCount: this.subscribedAssetIds.size,
+      },
+      "Sending Polymarket market subscription payload",
     );
+
+    this.socket.send(JSON.stringify(payload));
+    payload.assets_ids.forEach((assetId) => this.subscribedAssetIds.add(assetId));
+    this.initialSubscriptionSent = true;
   }
 
   private scheduleReconnect(): void {
@@ -266,5 +387,78 @@ export class PolymarketWsMarketClient extends EventEmitter {
         this.connect();
       }
     }, delayMs);
+  }
+
+  private sanitizeAssetIds(assetIds: string[]): {
+    validAssetIds: string[];
+    invalidAssetCount: number;
+    duplicateAssetCount: number;
+  } {
+    const seen = new Set<string>();
+    const validAssetIds: string[] = [];
+    let invalidAssetCount = 0;
+    let duplicateAssetCount = 0;
+
+    for (const assetId of assetIds) {
+      const normalized = String(assetId ?? "").trim();
+      if (!normalized) {
+        invalidAssetCount += 1;
+        continue;
+      }
+
+      if (seen.has(normalized)) {
+        duplicateAssetCount += 1;
+        continue;
+      }
+
+      seen.add(normalized);
+      validAssetIds.push(normalized);
+    }
+
+    return {
+      validAssetIds,
+      invalidAssetCount,
+      duplicateAssetCount,
+    };
+  }
+
+  private buildInitialSubscriptionPayload(assetIds: string[]): MarketSubscriptionPayload | null {
+    if (assetIds.length === 0) {
+      return null;
+    }
+
+    return {
+      assets_ids: assetIds,
+      type: "market",
+      custom_feature_enabled: true,
+    };
+  }
+
+  private buildIncrementalSubscriptionPayload(assetIds: string[]): MarketSubscriptionPayload | null {
+    if (assetIds.length === 0) {
+      return null;
+    }
+
+    return {
+      assets_ids: assetIds,
+      operation: "subscribe",
+      custom_feature_enabled: true,
+    };
+  }
+
+  private toRawText(raw: unknown): string {
+    if (typeof raw === "string") {
+      return raw;
+    }
+
+    if (Buffer.isBuffer(raw)) {
+      return raw.toString("utf8");
+    }
+
+    if (Array.isArray(raw) && raw.every((item) => Buffer.isBuffer(item))) {
+      return Buffer.concat(raw).toString("utf8");
+    }
+
+    return String(raw ?? "");
   }
 }
