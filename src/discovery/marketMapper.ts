@@ -1,6 +1,23 @@
 import { GammaMarket } from "../clients/polymarketDiscoveryClient";
 import { DiscoveredMarket, MarketMetadata, Outcome } from "../persistence/models";
 
+export type BtcMarketMatchSource = "slug" | "ticker" | "events.slug" | "question";
+
+export interface BtcMarketEvaluation {
+  isCandidate: boolean;
+  isTarget: boolean;
+  intervalMinutes: 5 | 15 | null;
+  matchedBy: BtcMarketMatchSource | null;
+  matchedPattern: string | null;
+  matchedValue: string | null;
+  discardReason: string | null;
+}
+
+interface SearchField {
+  source: BtcMarketMatchSource;
+  value: string;
+}
+
 function parseJsonArray(value: string[] | string | undefined): string[] {
   if (!value) {
     return [];
@@ -18,18 +35,254 @@ function parseJsonArray(value: string[] | string | undefined): string[] {
   }
 }
 
-function extractInterval(question: string): 5 | 15 | null {
-  const normalized = question.toLowerCase();
+function normalize(value: string): string {
+  return value.trim().toLowerCase();
+}
 
-  if (normalized.includes("bitcoin") && normalized.includes("up or down") && normalized.includes("5 minute")) {
+function collectSearchFields(market: GammaMarket): SearchField[] {
+  const fields: SearchField[] = [];
+  const push = (source: BtcMarketMatchSource, value: string | undefined): void => {
+    if (!value) {
+      return;
+    }
+
+    const normalized = value.trim();
+    if (!normalized) {
+      return;
+    }
+
+    fields.push({ source, value: normalized });
+  };
+
+  push("slug", market.slug);
+  push("ticker", market.ticker);
+
+  for (const eventRef of market.events ?? []) {
+    push("events.slug", eventRef.slug);
+  }
+
+  push("question", market.question);
+  return fields;
+}
+
+function isPotentialBtcCandidate(value: string): boolean {
+  const normalized = normalize(value);
+  return (
+    normalized.includes("btc") ||
+    normalized.includes("bitcoin") ||
+    normalized.includes("updown") ||
+    normalized.includes("up or down") ||
+    normalized.includes("up-or-down")
+  );
+}
+
+function extractIntervalFromQuestion(question: string): 5 | 15 | null {
+  const normalized = normalize(question);
+
+  if (!normalized.includes("bitcoin") || !normalized.includes("up or down")) {
+    return null;
+  }
+
+  if (/\b5m\b|\b5\s*minute(s)?\b/.test(normalized)) {
     return 5;
   }
 
-  if (normalized.includes("bitcoin") && normalized.includes("up or down") && normalized.includes("15 minute")) {
+  if (/\b15m\b|\b15\s*minute(s)?\b/.test(normalized)) {
     return 15;
   }
 
+  const rangeMatch = question.match(
+    /(\d{1,2}):(\d{2})\s*(AM|PM)?\s*(?:-|to)\s*(\d{1,2}):(\d{2})\s*(AM|PM)?/i,
+  );
+  if (!rangeMatch) {
+    return null;
+  }
+
+  const [, startHourText, startMinuteText, startMeridiem, endHourText, endMinuteText, endMeridiem] = rangeMatch;
+  const startMinutes = toClockMinutes(startHourText, startMinuteText, startMeridiem);
+  const endMinutes = toClockMinutes(endHourText, endMinuteText, endMeridiem ?? startMeridiem);
+  if (startMinutes === null || endMinutes === null) {
+    return null;
+  }
+
+  const diff = (endMinutes - startMinutes + 24 * 60) % (24 * 60);
+  if (diff === 5 || diff === 15) {
+    return diff;
+  }
+
   return null;
+}
+
+function toClockMinutes(
+  hourText: string,
+  minuteText: string,
+  meridiem: string | undefined,
+): number | null {
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+    return null;
+  }
+
+  if (!meridiem) {
+    return hour * 60 + minute;
+  }
+
+  const normalizedMeridiem = meridiem.toUpperCase();
+  const wrappedHour = hour % 12;
+  return (normalizedMeridiem === "PM" ? wrappedHour + 12 : wrappedHour) * 60 + minute;
+}
+
+function matchSlugLikeValue(value: string): { intervalMinutes: 5 | 15; pattern: string } | null {
+  const normalized = normalize(value);
+
+  if (/btc-(updown|up-or-down)-5m(?:-|$)/.test(normalized)) {
+    return {
+      intervalMinutes: 5,
+      pattern: "btc-updown-5m-*",
+    };
+  }
+
+  if (/btc-(updown|up-or-down)-15m(?:-|$)/.test(normalized)) {
+    return {
+      intervalMinutes: 15,
+      pattern: "btc-updown-15m-*",
+    };
+  }
+
+  return null;
+}
+
+export function evaluateBtcTargetMarket(market: GammaMarket): BtcMarketEvaluation {
+  const searchFields = collectSearchFields(market);
+  const candidateFields = searchFields.filter((field) => isPotentialBtcCandidate(field.value));
+  const conditionId = market.conditionId ?? market.condition_id;
+
+  if (candidateFields.length === 0) {
+    return {
+      isCandidate: false,
+      isTarget: false,
+      intervalMinutes: null,
+      matchedBy: null,
+      matchedPattern: null,
+      matchedValue: null,
+      discardReason: "no_btc_markers",
+    };
+  }
+
+  for (const field of searchFields) {
+    if (field.source === "question") {
+      const intervalMinutes = extractIntervalFromQuestion(field.value);
+      if (intervalMinutes) {
+        if (!conditionId) {
+          return {
+            isCandidate: true,
+            isTarget: false,
+            intervalMinutes,
+            matchedBy: field.source,
+            matchedPattern: "Bitcoin Up or Down - ...",
+            matchedValue: field.value,
+            discardReason: "missing_condition_id",
+          };
+        }
+
+        if (market.acceptingOrders === false) {
+          return {
+            isCandidate: true,
+            isTarget: false,
+            intervalMinutes,
+            matchedBy: field.source,
+            matchedPattern: "Bitcoin Up or Down - ...",
+            matchedValue: field.value,
+            discardReason: "accepting_orders_false",
+          };
+        }
+
+        return {
+          isCandidate: true,
+          isTarget: true,
+          intervalMinutes,
+          matchedBy: field.source,
+          matchedPattern: "Bitcoin Up or Down - ...",
+          matchedValue: field.value,
+          discardReason: null,
+        };
+      }
+
+      continue;
+    }
+
+    const slugLikeMatch = matchSlugLikeValue(field.value);
+    if (slugLikeMatch) {
+      if (!conditionId) {
+        return {
+          isCandidate: true,
+          isTarget: false,
+          intervalMinutes: slugLikeMatch.intervalMinutes,
+          matchedBy: field.source,
+          matchedPattern: slugLikeMatch.pattern,
+          matchedValue: field.value,
+          discardReason: "missing_condition_id",
+        };
+      }
+
+      if (market.acceptingOrders === false) {
+        return {
+          isCandidate: true,
+          isTarget: false,
+          intervalMinutes: slugLikeMatch.intervalMinutes,
+          matchedBy: field.source,
+          matchedPattern: slugLikeMatch.pattern,
+          matchedValue: field.value,
+          discardReason: "accepting_orders_false",
+        };
+      }
+
+      return {
+        isCandidate: true,
+        isTarget: true,
+        intervalMinutes: slugLikeMatch.intervalMinutes,
+        matchedBy: field.source,
+        matchedPattern: slugLikeMatch.pattern,
+        matchedValue: field.value,
+        discardReason: null,
+      };
+    }
+  }
+
+  if (!conditionId) {
+    return {
+      isCandidate: true,
+      isTarget: false,
+      intervalMinutes: null,
+      matchedBy: null,
+      matchedPattern: null,
+      matchedValue: null,
+      discardReason: "missing_condition_id",
+    };
+  }
+
+  if (market.acceptingOrders === false) {
+    return {
+      isCandidate: true,
+      isTarget: false,
+      intervalMinutes: null,
+      matchedBy: null,
+      matchedPattern: null,
+      matchedValue: null,
+      discardReason: "accepting_orders_false",
+    };
+  }
+
+  return {
+    isCandidate: true,
+    isTarget: false,
+    intervalMinutes: null,
+    matchedBy: null,
+    matchedPattern: null,
+    matchedValue: null,
+    discardReason: "no_supported_btc_updown_pattern",
+  };
 }
 
 function mapOutcomeTokenIds(market: GammaMarket): Record<Outcome, string> | null {
@@ -55,22 +308,24 @@ function mapOutcomeTokenIds(market: GammaMarket): Record<Outcome, string> | null
 }
 
 export function isBtcTargetMarket(market: GammaMarket): boolean {
-  return extractInterval(market.question ?? "") !== null;
+  return evaluateBtcTargetMarket(market).isTarget;
 }
 
-export function toDiscoveredMarket(market: GammaMarket): DiscoveredMarket | null {
-  const intervalMinutes = extractInterval(market.question ?? "");
+export function toDiscoveredMarket(
+  market: GammaMarket,
+  evaluation = evaluateBtcTargetMarket(market),
+): DiscoveredMarket | null {
   const conditionId = market.conditionId ?? market.condition_id;
-  if (!intervalMinutes || !conditionId) {
+  if (!evaluation.isTarget || !evaluation.intervalMinutes || !conditionId) {
     return null;
   }
 
   return {
     conditionId,
     marketId: market.id,
-    slug: market.slug,
-    question: market.question,
-    intervalMinutes,
+    slug: market.slug ?? "",
+    question: market.question ?? market.slug ?? market.ticker ?? "",
+    intervalMinutes: evaluation.intervalMinutes,
     active: Boolean(market.active),
     closed: Boolean(market.closed),
     discoveredAt: Date.now(),
@@ -80,8 +335,9 @@ export function toDiscoveredMarket(market: GammaMarket): DiscoveredMarket | null
 export function toMarketMetadata(
   market: GammaMarket,
   clobMarket: any,
+  evaluation = evaluateBtcTargetMarket(market),
 ): MarketMetadata | null {
-  const discovered = toDiscoveredMarket(market);
+  const discovered = toDiscoveredMarket(market, evaluation);
   const outcomeTokenIds = mapOutcomeTokenIds(market);
   if (!discovered || !outcomeTokenIds) {
     return null;
