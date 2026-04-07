@@ -8,17 +8,18 @@ import {
 } from "../src/signal/signalMetricPolicy";
 
 describe("signalMetricPolicy", () => {
-  it("uses evaluation time as delay fallback when the book snapshot predates the Binance move", () => {
-    const timing = computeSignalTiming(1_000, 900, 1_350);
+  it("measures delay against an older Polymarket book timestamp without truncating to zero", () => {
+    const timing = computeSignalTiming(1_710_000_001_000, 1_710_000_000_650, 1_710_000_000_700);
 
-    expect(timing.polymarketDetectedAt).toBe(1_350);
+    expect(timing.binanceMoveDetectedAt).toBe(1_710_000_001_000);
+    expect(timing.polymarketDetectedAt).toBe(1_710_000_000_650);
     expect(timing.estimatedDelayMs).toBe(350);
   });
 
   it("uses the newer Polymarket book timestamp when it is already after the Binance move", () => {
-    const timing = computeSignalTiming(1_000, 1_420, 1_500);
+    const timing = computeSignalTiming(1_710_000_001_000, 1_710_000_001_420, 1_710_000_001_500);
 
-    expect(timing.polymarketDetectedAt).toBe(1_420);
+    expect(timing.polymarketDetectedAt).toBe(1_710_000_001_420);
     expect(timing.estimatedDelayMs).toBe(420);
   });
 

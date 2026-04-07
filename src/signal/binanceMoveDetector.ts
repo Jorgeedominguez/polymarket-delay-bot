@@ -19,7 +19,9 @@ export class BinanceMoveDetector {
     const end = this.ticks[this.ticks.length - 1];
     const signedBps = calcBpsChange(start.price, end.price);
     const absoluteBps = Math.abs(signedBps);
-    const windowMs = Math.max(1, end.receivedAt - start.receivedAt);
+    const startTimestamp = this.resolveTickTimestamp(start);
+    const endTimestamp = this.resolveTickTimestamp(end);
+    const windowMs = Math.max(1, endTimestamp - startTimestamp);
     const speedBpsPerSecond = absoluteBps / (windowMs / 1000);
 
     return {
@@ -30,8 +32,8 @@ export class BinanceMoveDetector {
       windowMs,
       startPrice: start.price,
       endPrice: end.price,
-      startedAt: start.receivedAt,
-      endedAt: end.receivedAt,
+      startedAt: startTimestamp,
+      endedAt: endTimestamp,
     };
   }
 
@@ -44,5 +46,9 @@ export class BinanceMoveDetector {
     while (this.ticks.length > 0 && this.ticks[0].receivedAt < cutoff) {
       this.ticks.shift();
     }
+  }
+
+  private resolveTickTimestamp(tick: BinanceTick): number {
+    return tick.tradeTime || tick.eventTime || tick.receivedAt;
   }
 }

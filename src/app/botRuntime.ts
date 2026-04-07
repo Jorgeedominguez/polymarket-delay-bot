@@ -369,13 +369,27 @@ export class BotRuntime {
       });
 
       if (!risk.allowed) {
-        const skipReason = risk.reason ?? "risk_rejected";
+        const skipReason = this.prefixSkipReason(risk.reason ?? "risk_rejected", "risk");
         this.recordSignalMetric({
           ...baseMetric,
           decision: "skipped",
           skipReason,
           updatedAt: Date.now(),
         });
+        this.logger.info(
+          {
+            component: "riskManager",
+            conditionId: signal.conditionId,
+            market: baseMetric.marketLabel,
+            signalNotional: signal.notional,
+            openOrders: openOrders.length,
+            openPositions: positions.length,
+            totalExposureEstimate: positions.reduce((acc, position) => acc + position.entryNotional, 0) +
+              openOrders.reduce((acc, order) => acc + (order.size * order.price), 0),
+            skipReason,
+          },
+          "Blocked signal during risk evaluation",
+        );
         await this.notify("signal", `Senal descartada por riesgo: ${skipReason}`);
         continue;
       }
@@ -385,7 +399,7 @@ export class BotRuntime {
         this.recordSignalMetric({
           ...baseMetric,
           decision: "skipped",
-          skipReason: "entry_decision_null",
+          skipReason: this.prefixSkipReason("entry_decision_null", "execution"),
           updatedAt: Date.now(),
         });
         continue;
@@ -397,7 +411,9 @@ export class BotRuntime {
       this.recordSignalMetric({
         ...baseMetric,
         decision: entered ? "entered" : "skipped",
-        skipReason: entered ? null : (result.order.rejectReason ?? result.order.status.toLowerCase()),
+        skipReason: entered
+          ? null
+          : this.prefixSkipReason(result.order.rejectReason ?? result.order.status.toLowerCase(), "execution"),
         updatedAt: Date.now(),
       });
     }
@@ -670,7 +686,7 @@ export class BotRuntime {
       signal.bestAsk != null && signal.bestAsk > 0
         ? (Math.max(0, signal.bookPrice - signal.bestAsk) / signal.bestAsk) * 10_000
         : 0;
-    const timing = computeSignalTiming(signal.move.endedAt, targetBook.receivedAt, signal.createdAt);
+    const timing = computeSignalTiming(signal.move.endedAt, targetBook.timestamp, targetBook.receivedAt);
 
     return {
       signalId: signal.id,
@@ -678,7 +694,7 @@ export class BotRuntime {
       marketLabel: `BTC ${signal.intervalMinutes}m`,
       intervalMinutes: signal.intervalMinutes,
       outcome: signal.outcome,
-      binanceMoveDetectedAt: signal.move.endedAt,
+      binanceMoveDetectedAt: timing.binanceMoveDetectedAt,
       polymarketDetectedAt: timing.polymarketDetectedAt,
       estimatedDelayMs: timing.estimatedDelayMs,
       binanceMoveBps: signal.move.absoluteBps,
@@ -697,7 +713,9 @@ export class BotRuntime {
 
   private resolveSkipReason(reasons: string[], fallback: string): string {
     const filtered = reasons.filter(Boolean);
-    return filtered.length > 0 ? filtered.join(",") : fallback;
+    return filtered.length > 0
+      ? filtered.map((reason) => this.prefixSkipReason(reason, "signal")).join(",")
+      : this.prefixSkipReason(fallback, "signal");
   }
 
   private recordSignalMetric(metric: SignalMetricRecord): void {
@@ -735,7 +753,7 @@ export class BotRuntime {
     });
     const lastSeenAt = this.recentSignalFingerprints.get(fingerprint);
     if (lastSeenAt != null && signal.createdAt - lastSeenAt < SIGNAL_DEDUP_WINDOW_MS) {
-      return "duplicate_signal";
+      return this.prefixSkipReason("duplicate_signal", "signal");
     }
 
     this.recentSignalFingerprints.set(fingerprint, signal.createdAt);
@@ -748,7 +766,7 @@ export class BotRuntime {
     });
 
     if (noiseDecision.reason) {
-      return noiseDecision.reason;
+      return this.prefixSkipReason(noiseDecision.reason, "signal");
     }
 
     return null;
@@ -787,6 +805,17 @@ export class BotRuntime {
       },
       "Signal engine interval coverage summary",
     );
+  }
+
+  private prefixSkipReason(
+    reason: string,
+    source: "signal" | "risk" | "execution",
+  ): string {
+    if (!reason) {
+      return `${source}:unspecified`;
+    }
+
+    return reason.includes(":") ? reason : `${source}:${reason}`;
   }
 
   private async notify(

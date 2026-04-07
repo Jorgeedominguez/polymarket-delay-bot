@@ -61,6 +61,10 @@ export class RiskManager {
 
     const totalExposure = this.exposureManager.totalExposure(context.positions, context.openOrders);
     if (totalExposure + context.signal.notional > this.config.risk.maxTotalExposure) {
+      if (totalExposure <= 0) {
+        return { allowed: false, reason: "signal_notional_exceeds_max_total_exposure" };
+      }
+
       return { allowed: false, reason: "max_total_exposure_reached" };
     }
 

@@ -6,6 +6,7 @@ export const SIGNAL_MOVE_BUCKET_BPS = 2;
 export const SIGNAL_MAX_VIABLE_SPREAD_BPS = 150;
 
 export interface SignalTiming {
+  binanceMoveDetectedAt: number;
   polymarketDetectedAt: number;
   estimatedDelayMs: number;
 }
@@ -34,14 +35,18 @@ export function computeSpreadObserved(
 
 export function computeSignalTiming(
   moveDetectedAt: number,
+  bookTimestamp: number,
   bookReceivedAt: number,
-  evaluatedAt: number,
 ): SignalTiming {
-  const polymarketDetectedAt = bookReceivedAt > moveDetectedAt ? bookReceivedAt : evaluatedAt;
+  const normalizedMoveDetectedAt = normalizeTimestampMs(moveDetectedAt);
+  const normalizedBookTimestamp = normalizeTimestampMs(bookTimestamp);
+  const normalizedBookReceivedAt = normalizeTimestampMs(bookReceivedAt);
+  const polymarketDetectedAt = choosePolymarketObservedAt(normalizedBookTimestamp, normalizedBookReceivedAt);
 
   return {
+    binanceMoveDetectedAt: normalizedMoveDetectedAt,
     polymarketDetectedAt,
-    estimatedDelayMs: Math.max(0, polymarketDetectedAt - moveDetectedAt),
+    estimatedDelayMs: Math.abs(polymarketDetectedAt - normalizedMoveDetectedAt),
   };
 }
 
@@ -122,4 +127,29 @@ export function buildSignalFingerprint(input: {
     input.outcome,
     `move=${moveBucket.toFixed(0)}`,
   ].join("|");
+}
+
+function normalizeTimestampMs(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+
+  return value < 1_000_000_000_000 ? value * 1000 : value;
+}
+
+function choosePolymarketObservedAt(bookTimestamp: number, bookReceivedAt: number): number {
+  if (!Number.isFinite(bookTimestamp) || bookTimestamp <= 0) {
+    return bookReceivedAt;
+  }
+
+  if (!Number.isFinite(bookReceivedAt) || bookReceivedAt <= 0) {
+    return bookTimestamp;
+  }
+
+  const drift = Math.abs(bookReceivedAt - bookTimestamp);
+  if (drift <= 60_000) {
+    return bookTimestamp;
+  }
+
+  return bookReceivedAt;
 }
