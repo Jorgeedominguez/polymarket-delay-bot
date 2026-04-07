@@ -29,6 +29,13 @@ import { RuntimeRepository } from "../persistence/repositories/runtimeRepository
 import { RiskManager } from "../risk/riskManager";
 import { BinanceMoveDetector } from "../signal/binanceMoveDetector";
 import { SignalEngine } from "../signal/signalEngine";
+import {
+  buildSignalFingerprint,
+  computeSignalTiming,
+  computeSpreadObserved,
+  evaluateSignalNoise,
+  SIGNAL_DEDUP_WINDOW_MS,
+} from "../signal/signalMetricPolicy";
 import { EntryDecision } from "../strategy/entryDecision";
 import { ExitDecision } from "../strategy/exitDecision";
 import { formatUsd } from "../utils/math";
@@ -51,6 +58,16 @@ interface BotRuntimeDeps {
   orderManager: OrderManager;
   positionManager: PositionManager;
   cancelManager: CancelManager;
+}
+
+interface SignalScanSummary {
+  moveBps: number;
+  discoveredByInterval: Record<5 | 15, number>;
+  withBooksByInterval: Record<5 | 15, number>;
+  producedByInterval: Record<5 | 15, number>;
+  persistedByInterval: Record<5 | 15, number>;
+  suppressedByInterval: Record<5 | 15, number>;
+  suppressedReasons: Record<string, number>;
 }
 
 export class BotRuntime {
@@ -79,6 +96,8 @@ export class BotRuntime {
   private latestMove: BinanceMove | null = null;
   private readonly marketByConditionId = new Map<string, MarketMetadata>();
   private readonly booksByAssetId = new Map<string, PolymarketBookSnapshot>();
+  private readonly recentSignalFingerprints = new Map<string, number>();
+  private lastSignalScanLogAt = 0;
 
   constructor(deps: BotRuntimeDeps) {
     this.config = deps.config;
@@ -265,24 +284,62 @@ export class BotRuntime {
       return;
     }
 
+    const scanSummary: SignalScanSummary = {
+      moveBps: this.latestMove?.absoluteBps ?? 0,
+      discoveredByInterval: { 5: 0, 15: 0 },
+      withBooksByInterval: { 5: 0, 15: 0 },
+      producedByInterval: { 5: 0, 15: 0 },
+      persistedByInterval: { 5: 0, 15: 0 },
+      suppressedByInterval: { 5: 0, 15: 0 },
+      suppressedReasons: {},
+    };
+
     for (const market of this.marketByConditionId.values()) {
+      scanSummary.discoveredByInterval[market.intervalMinutes] += 1;
       const positions = this.positionManager.getOpenPositions();
       const openOrders = this.orderManager.getOpenOrders();
       const pnlSummary = this.repository.getPnlSummary();
       const yesBook = this.booksByAssetId.get(market.yesTokenId);
       const noBook = this.booksByAssetId.get(market.noTokenId);
+      if (yesBook && noBook) {
+        scanSummary.withBooksByInterval[market.intervalMinutes] += 1;
+      }
       const signal = this.signalEngine.evaluate(market, yesBook, noBook, this.latestMove);
       if (!signal) {
         continue;
       }
+      scanSummary.producedByInterval[market.intervalMinutes] += 1;
 
       const targetBook = signal.outcome === "YES" ? yesBook : noBook;
       if (!targetBook) {
         continue;
       }
 
-      this.repository.saveSignal(signal);
       const baseMetric = this.buildSignalMetric(signal, targetBook);
+      const suppressionReason = this.getSignalSuppressionReason(signal, market, baseMetric);
+      if (suppressionReason) {
+        scanSummary.suppressedByInterval[market.intervalMinutes] += 1;
+        scanSummary.suppressedReasons[suppressionReason] = (scanSummary.suppressedReasons[suppressionReason] ?? 0) + 1;
+        this.logger.info(
+          {
+            component: "signalEngine",
+            conditionId: signal.conditionId,
+            market: baseMetric.marketLabel,
+            outcome: signal.outcome,
+            moveBps: baseMetric.binanceMoveBps,
+            grossEdgeBps: baseMetric.grossEdgeBps,
+            netEdgeBps: baseMetric.netEdgeBps,
+            spreadBps: baseMetric.spreadObservedBps,
+            delayMs: baseMetric.estimatedDelayMs,
+            reason: suppressionReason,
+          },
+          "Suppressed shadow signal before persistence",
+        );
+        continue;
+      }
+
+      this.repository.saveSignal(signal);
+      scanSummary.persistedByInterval[market.intervalMinutes] += 1;
 
       if (signal.status !== "approved") {
         const skipReason = this.resolveSkipReason(signal.reasons, "signal_threshold_or_score");
@@ -344,6 +401,8 @@ export class BotRuntime {
         updatedAt: Date.now(),
       });
     }
+
+    this.maybeLogSignalScanSummary(scanSummary, tick.receivedAt);
   }
 
   onBook(snapshot: PolymarketBookSnapshot): void {
@@ -602,16 +661,16 @@ export class BotRuntime {
   }
 
   private buildSignalMetric(signal: TradeSignal, targetBook: PolymarketBookSnapshot): SignalMetricRecord {
-    const spreadObserved = signal.bestAsk != null && signal.bestBid != null ? signal.bestAsk - signal.bestBid : 0;
-    const midpoint =
-      signal.bestAsk != null && signal.bestBid != null
-        ? (signal.bestAsk + signal.bestBid) / 2
-        : signal.bookPrice;
-    const spreadObservedBps = midpoint > 0 ? (spreadObserved / midpoint) * 10_000 : 0;
+    const { spreadObserved, spreadObservedBps } = computeSpreadObserved(
+      signal.bestBid,
+      signal.bestAsk,
+      signal.bookPrice,
+    );
     const orderBookSlippageBps =
       signal.bestAsk != null && signal.bestAsk > 0
         ? (Math.max(0, signal.bookPrice - signal.bestAsk) / signal.bestAsk) * 10_000
         : 0;
+    const timing = computeSignalTiming(signal.move.endedAt, targetBook.receivedAt, signal.createdAt);
 
     return {
       signalId: signal.id,
@@ -620,8 +679,8 @@ export class BotRuntime {
       intervalMinutes: signal.intervalMinutes,
       outcome: signal.outcome,
       binanceMoveDetectedAt: signal.move.endedAt,
-      polymarketDetectedAt: targetBook.receivedAt,
-      estimatedDelayMs: Math.max(0, targetBook.receivedAt - signal.move.endedAt),
+      polymarketDetectedAt: timing.polymarketDetectedAt,
+      estimatedDelayMs: timing.estimatedDelayMs,
       binanceMoveBps: signal.move.absoluteBps,
       grossEdgeBps: signal.grossEdgeBps,
       netEdgeBps: signal.netEdgeBps,
@@ -659,6 +718,74 @@ export class BotRuntime {
         skipReason: metric.skipReason,
       },
       "Shadow signal analyzed",
+    );
+  }
+
+  private getSignalSuppressionReason(
+    signal: TradeSignal,
+    market: MarketMetadata,
+    metric: SignalMetricRecord,
+  ): string | null {
+    this.pruneRecentSignalFingerprints(signal.createdAt);
+
+    const fingerprint = buildSignalFingerprint({
+      conditionId: signal.conditionId,
+      outcome: signal.outcome,
+      binanceMoveBps: metric.binanceMoveBps,
+    });
+    const lastSeenAt = this.recentSignalFingerprints.get(fingerprint);
+    if (lastSeenAt != null && signal.createdAt - lastSeenAt < SIGNAL_DEDUP_WINDOW_MS) {
+      return "duplicate_signal";
+    }
+
+    this.recentSignalFingerprints.set(fingerprint, signal.createdAt);
+
+    const noiseDecision = evaluateSignalNoise(this.config, {
+      intervalMinutes: market.intervalMinutes,
+      priceReference: signal.bookPrice,
+      spreadObservedBps: metric.spreadObservedBps,
+      binanceMoveBps: metric.binanceMoveBps,
+    });
+
+    if (noiseDecision.reason) {
+      return noiseDecision.reason;
+    }
+
+    return null;
+  }
+
+  private pruneRecentSignalFingerprints(now: number): void {
+    for (const [fingerprint, seenAt] of this.recentSignalFingerprints.entries()) {
+      if (now - seenAt > SIGNAL_DEDUP_WINDOW_MS * 4) {
+        this.recentSignalFingerprints.delete(fingerprint);
+      }
+    }
+  }
+
+  private maybeLogSignalScanSummary(summary: SignalScanSummary, now: number): void {
+    if (now - this.lastSignalScanLogAt < 30_000) {
+      return;
+    }
+
+    this.lastSignalScanLogAt = now;
+
+    const market5mCoverage = `${summary.withBooksByInterval[5]}/${summary.discoveredByInterval[5]}`;
+    const market15mCoverage = `${summary.withBooksByInterval[15]}/${summary.discoveredByInterval[15]}`;
+
+    this.logger.info(
+      {
+        component: "signalEngine",
+        moveBps: summary.moveBps,
+        discoveredByInterval: summary.discoveredByInterval,
+        withBooksByInterval: summary.withBooksByInterval,
+        producedByInterval: summary.producedByInterval,
+        persistedByInterval: summary.persistedByInterval,
+        suppressedByInterval: summary.suppressedByInterval,
+        suppressedReasons: summary.suppressedReasons,
+        coverage5m: market5mCoverage,
+        coverage15m: market15mCoverage,
+      },
+      "Signal engine interval coverage summary",
     );
   }
 

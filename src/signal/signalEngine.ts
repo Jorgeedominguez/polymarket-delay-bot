@@ -4,6 +4,7 @@ import { MarketMetadata, BinanceMove, PolymarketBookSnapshot, TradeSignal } from
 import { SignalScorer } from "../strategy/signalScorer";
 import { EdgeCalculator } from "./edgeCalculator";
 import { PolymarketLagDetector } from "./polymarketLagDetector";
+import { computeSpreadObserved, evaluateSignalNoise } from "./signalMetricPolicy";
 
 export class SignalEngine {
   constructor(
@@ -53,12 +54,24 @@ export class SignalEngine {
       move,
     };
 
+    const { spreadObservedBps } = computeSpreadObserved(baseSignal.bestBid, baseSignal.bestAsk, edge.bookPrice);
+    const noiseDecision = evaluateSignalNoise(this.config, {
+      intervalMinutes: market.intervalMinutes,
+      priceReference: edge.bookPrice,
+      spreadObservedBps,
+      binanceMoveBps: move.absoluteBps,
+    });
+    if (noiseDecision.reason) {
+      baseSignal.reasons.push(noiseDecision.reason);
+    }
+
     const score = this.signalScorer.score(baseSignal, move);
     const approved =
       !baseSignal.stale &&
       baseSignal.netEdgeBps >= this.config.execution.edgeThresholdBps &&
       score >= this.config.execution.signalMinScore &&
-      baseSignal.executableSize >= market.minimumOrderSize;
+      baseSignal.executableSize >= market.minimumOrderSize &&
+      !noiseDecision.suppress;
 
     return {
       ...baseSignal,
